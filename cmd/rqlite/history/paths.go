@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-const historyFile = ".rqlite_history"
+const historyFile = ".clif_history"
 
 // Path returns the full path to the history file.
 func Path() (string, error) {
