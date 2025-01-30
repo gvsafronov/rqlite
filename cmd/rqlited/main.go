@@ -1,633 +1,730 @@
-// Command rqlited is the rqlite server.
+// Command rqlite is the command-line interface for rqlite.
 package main
 
 import (
-	"context"
-	"crypto/tls"
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
+	"sort"
 	"strings"
 	"syscall"
-	"time"
 
-	consul "github.com/rqlite/rqlite-disco-clients/consul"
-	"github.com/rqlite/rqlite-disco-clients/dns"
-	"github.com/rqlite/rqlite-disco-clients/dnssrv"
-	etcd "github.com/rqlite/rqlite-disco-clients/etcd"
-	"github.com/rqlite/rqlite/v8/auth"
-	"github.com/rqlite/rqlite/v8/auto/backup"
-	"github.com/rqlite/rqlite/v8/auto/restore"
-	"github.com/rqlite/rqlite/v8/aws"
-	"github.com/rqlite/rqlite/v8/cluster"
+	"github.com/Bowery/prompt"
+	"github.com/mkideal/cli"
+	clix "github.com/mkideal/cli/ext"
 	"github.com/rqlite/rqlite/v8/cmd"
-	"github.com/rqlite/rqlite/v8/db"
-	"github.com/rqlite/rqlite/v8/disco"
-	"github.com/rqlite/rqlite/v8/extensions"
-	httpd "github.com/rqlite/rqlite/v8/http"
-	"github.com/rqlite/rqlite/v8/rarchive"
+	"github.com/rqlite/rqlite/v8/cmd/rqlite/history"
+	httpcl "github.com/rqlite/rqlite/v8/cmd/rqlite/http"
 	"github.com/rqlite/rqlite/v8/rtls"
-	"github.com/rqlite/rqlite/v8/store"
-	"github.com/rqlite/rqlite/v8/tcp"
 )
 
-const logo = `
-            _ _ _
-           | (_) |
-  _ __ __ _| |_| |_ ___
- | '__/ _  | | | __/ _ \   The lightweight, distributed
- | | | (_| | | | ||  __/   relational database.
- |_|  \__, |_|_|\__\___|
-         | |               www.rqlite.io
-         |_|
+const maxRedirect = 21
 
-`
+type Node struct {
+	ApiAddr string `json:"api_addr"`
+	_       json.RawMessage
+}
 
-const name = `rqlited`
-const desc = `rqlite is a lightweight, distributed relational database, which uses SQLite as its
-storage engine. It provides an easy-to-use, fault-tolerant store for relational data.
+type Nodes map[string]Node
 
-Visit https://www.rqlite.io to learn more.`
+type argT struct {
+	cli.Helper
+	Alternatives string        `cli:"a,alternatives" usage:"comma separated list of 'host:port' pairs to use as fallback"`
+	Protocol     string        `cli:"s,scheme" usage:"protocol scheme (http or https)" dft:"http"`
+	Host         string        `cli:"H,host" usage:"rqlited host address" dft:"127.0.0.1"`
+	Port         uint16        `cli:"p,port" usage:"rqlited host port" dft:"4001"`
+	Prefix       string        `cli:"P,prefix" usage:"rqlited HTTP URL prefix" dft:"/"`
+	Insecure     bool          `cli:"i,insecure" usage:"do not verify rqlited HTTPS certificate" dft:"false"`
+	CACert       string        `cli:"c,ca-cert" usage:"path to trusted X.509 root CA certificate"`
+	ClientCert   string        `cli:"d,client-cert" usage:"path to client X.509 certificate for mTLS"`
+	ClientKey    string        `cli:"k,client-key" usage:"path to client X.509 key for mTLS"`
+	Credentials  string        `cli:"u,user" usage:"set basic auth credentials in form username:password"`
+	Version      bool          `cli:"v,version" usage:"display CLI version"`
+	HTTPTimeout  clix.Duration `cli:"t,http-timeout" usage:"set timeout on HTTP requests" dft:"30s"`
+}
+
+var cliHelp []string
 
 func init() {
-	log.SetFlags(log.LstdFlags)
-	log.SetOutput(os.Stderr)
-	log.SetPrefix(fmt.Sprintf("[%s] ", name))
+	cliHelp = []string{
+		`.backup FILE                                  Write database backup to FILE`,
+		`.blobarray on|off                             Display BLOB data as byte arrays`,
+		`.boot FILE                                    Boot the node using a SQLite file read from FILE`,
+		`.consistency [none|weak|linearizable|strong]  Show or set read consistency level`,
+		`.dump FILE                                    Dump the database in SQL text format to FILE`,
+		`.exit                                         Exit this program`,
+		`.expvar                                       Show expvar (Go runtime) information for connected node`,
+		`.extensions                                   Show loaded SQLite extensions`,
+		`.help                                         Show this message`,
+		`.indexes                                      Show names of all indexes`,
+		`.quit                                         Exit this program`,
+		`.ready                                        Show ready status for connected node`,
+		`.remove NODEID                                Remove node NODEID from the cluster`,
+		`.restore FILE                                 Load using SQLite file or SQL dump contained in FILE`,
+		`.nodes [all]                                  Show connection status of voting nodes. 'all' to show all nodes`,
+		`.schema                                       Show CREATE statements for all tables`,
+		`.snapshot                                     Request a Raft snapshot and log truncation on connected node`,
+		`.status                                       Show status and diagnostic information for connected node`,
+		`.sysdump FILE                                 Dump system diagnostics to FILE`,
+		`.tables                                       List names of tables`,
+		`.timer on|off                                 Turn query timings on or off`,
+	}
+	sort.Strings(cliHelp)
 }
 
 func main() {
-	// Handle signals first, so signal handling is established before anything else.
-	sigCh := HandleSignals(syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	mainCtx, _ := CreateContext(sigCh)
-
-	cfg, err := ParseFlags(name, desc, &BuildInfo{
-		Version:       cmd.Version,
-		Commit:        cmd.Commit,
-		Branch:        cmd.Branch,
-		SQLiteVersion: db.DBVersion,
-	})
-	if err != nil {
-		log.Fatalf("failed to parse command-line flags: %s", err.Error())
-	}
-	fmt.Print(logo)
-
-	// Configure logging and pump out initial message.
-	log.Printf("%s starting, version %s, SQLite %s, commit %s, branch %s, compiler (toolchain) %s, compiler (command) %s",
-		name, cmd.Version, db.DBVersion, cmd.Commit, cmd.Branch, runtime.Compiler, cmd.CompilerCommand)
-	log.Printf("%s, target architecture is %s, operating system target is %s", runtime.Version(),
-		runtime.GOARCH, runtime.GOOS)
-	log.Printf("launch command: %s", strings.Join(os.Args, " "))
-
-	// Start requested profiling.
-	startProfile(cfg.CPUProfile, cfg.MemProfile, cfg.TraceProfile)
-
-	// Create internode network mux and configure.
-	muxLn, err := net.Listen("tcp", cfg.RaftAddr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %s", cfg.RaftAddr, err.Error())
-	}
-	mux, err := startNodeMux(cfg, muxLn)
-	if err != nil {
-		log.Fatalf("failed to start node mux: %s", err.Error())
-	}
-
-	// Raft internode layer
-	raftLn := mux.Listen(cluster.MuxRaftHeader)
-	raftDialer, err := cluster.CreateRaftDialer(cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert,
-		cfg.NodeVerifyServerName, cfg.NoNodeVerify)
-	if err != nil {
-		log.Fatalf("failed to create Raft dialer: %s", err.Error())
-	}
-	raftTn := tcp.NewLayer(raftLn, raftDialer)
-
-	// Create extension store.
-	extensionsStore, err := createExtensionsStore(cfg)
-	if err != nil {
-		log.Fatalf("failed to create extensions store: %s", err.Error())
-	}
-	extensionsPaths, err := extensionsStore.List()
-	if err != nil {
-		log.Fatalf("failed to list extensions: %s", err.Error())
-	}
-
-	// Create the store.
-	str, err := createStore(cfg, raftTn, extensionsPaths)
-	if err != nil {
-		log.Fatalf("failed to create store: %s", err.Error())
-	}
-
-	// Install the auto-restore data, if necessary.
-	if cfg.AutoRestoreFile != "" {
-		hd, err := store.HasData(str.Path())
-		if err != nil {
-			log.Fatalf("failed to check for existing data: %s", err.Error())
-		}
-		if hd {
-			log.Printf("auto-restore requested, but data already exists in %s, skipping", str.Path())
-		} else {
-			log.Printf("auto-restore requested, initiating download")
-			start := time.Now()
-			path, errOK, err := restore.DownloadFile(mainCtx, cfg.AutoRestoreFile)
-			if err != nil {
-				var b strings.Builder
-				b.WriteString(fmt.Sprintf("failed to download auto-restore file: %s", err.Error()))
-				if errOK {
-					b.WriteString(", continuing with node startup anyway")
-					log.Print(b.String())
-				} else {
-					log.Fatal(b.String())
-				}
-			} else {
-				log.Printf("auto-restore file downloaded in %s", time.Since(start))
-				if err := str.SetRestorePath(path); err != nil {
-					log.Fatalf("failed to preload auto-restore data: %s", err.Error())
-				}
-			}
-		}
-	}
-
-	// Get any credential store.
-	credStr, err := credentialStore(cfg)
-	if err != nil {
-		log.Fatalf("failed to get credential store: %s", err.Error())
-	}
-
-	// Create cluster service now, so nodes will be able to learn information about each other.
-	clstrServ, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
-	if err != nil {
-		log.Fatalf("failed to create cluster service: %s", err.Error())
-	}
-
-	// Create the HTTP service.
-	//
-	// We want to start the HTTP server as soon as possible, so the node is responsive and external
-	// systems can see that it's running. We still have to open the Store though, so the node won't
-	// be able to do much until that happens however.
-	clstrClient, err := createClusterClient(cfg, clstrServ)
-	if err != nil {
-		log.Fatalf("failed to create cluster client: %s", err.Error())
-	}
-	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr)
-	if err != nil {
-		log.Fatalf("failed to start HTTP server: %s", err.Error())
-	}
-
-	// Now, open store. How long this takes does depend on how much data is being stored by rqlite.
-	if err := str.Open(); err != nil {
-		log.Fatalf("failed to open store: %s", err.Error())
-	}
-
-	// Register remaining status providers.
-	if err := httpServ.RegisterStatus("cluster", clstrServ); err != nil {
-		log.Fatalf("failed to register cluster status provider: %s", err.Error())
-	}
-	if err := httpServ.RegisterStatus("network", tcp.NetworkReporter{}); err != nil {
-		log.Fatalf("failed to register network status provider: %s", err.Error())
-	}
-	if err := httpServ.RegisterStatus("mux", mux); err != nil {
-		log.Fatalf("failed to register mux status provider: %s", err.Error())
-	}
-	if err := httpServ.RegisterStatus("extensions", extensionsStore); err != nil {
-		log.Fatalf("failed to register extensions status provider: %s", err.Error())
-	}
-
-	// Create the cluster!
-	nodes, err := str.Nodes()
-	if err != nil {
-		log.Fatalf("failed to get nodes %s", err.Error())
-	}
-	if err := createCluster(mainCtx, cfg, len(nodes) > 0, clstrClient, str, httpServ, credStr); err != nil {
-		log.Fatalf("clustering failure: %s", err.Error())
-	}
-
-	// Tell the user the node is ready for HTTP, giving some advice on how to connect.
-	log.Printf("node HTTP API available at %s", cfg.HTTPURL())
-	h, p, _ := net.SplitHostPort(cfg.HTTPAdv)
-	log.Printf("connect using the command-line tool via 'rqlite -H %s -p %s'", h, p)
-
-	// Start any requested auto-backups
-	backupSrv, err := startAutoBackups(mainCtx, cfg, str)
-	if err != nil {
-		log.Fatalf("failed to start auto-backups: %s", err.Error())
-	}
-	if backupSrv != nil {
-		httpServ.RegisterStatus("auto_backups", backupSrv)
-	}
-
-	// Block until done.
-	<-mainCtx.Done()
-
-	// Stop the HTTP server and other network access first so clients get notification as soon as
-	// possible that the node is going away.
-	httpServ.Close()
-	clstrServ.Close()
-
-	if cfg.RaftClusterRemoveOnShutdown {
-		remover := cluster.NewRemover(clstrClient, 5*time.Second, str)
-		remover.SetCredentials(cluster.CredentialsFor(credStr, cfg.JoinAs))
-		log.Printf("initiating removal of this node from cluster before shutdown")
-		if err := remover.Do(cfg.NodeID, true); err != nil {
-			log.Fatalf("failed to remove this node from cluster before shutdown: %s", err.Error())
-		}
-		log.Printf("removed this node successfully from cluster before shutdown")
-	}
-
-	if cfg.RaftStepdownOnShutdown {
-		if str.IsLeader() {
-			// Don't log a confusing message if (probably) not Leader
-			log.Printf("stepping down as Leader before shutdown")
-		}
-		// Perform a stepdown, ignore any errors.
-		str.Stepdown(true)
-	}
-	muxLn.Close()
-
-	if err := str.Close(true); err != nil {
-		log.Printf("failed to close store: %s", err.Error())
-	}
-	stopProfile()
-	log.Println("rqlite server stopped")
-}
-
-func startAutoBackups(ctx context.Context, cfg *Config, str *store.Store) (*backup.Uploader, error) {
-	if cfg.AutoBackupFile == "" {
-		return nil, nil
-	}
-
-	b, err := backup.ReadConfigFile(cfg.AutoBackupFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read auto-backup file: %s", err.Error())
-	}
-
-	uCfg, s3cfg, err := backup.Unmarshal(b)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse auto-backup file: %s", err.Error())
-	}
-	provider := store.NewProvider(str, uCfg.Vacuum, !uCfg.NoCompress)
-	s3ClientOps := &aws.S3ClientOpts{
-		ForcePathStyle: s3cfg.ForcePathStyle,
-		Timestamp:      uCfg.Timestamp,
-	}
-	sc, err := aws.NewS3Client(s3cfg.Endpoint, s3cfg.Region, s3cfg.AccessKeyID, s3cfg.SecretAccessKey,
-		s3cfg.Bucket, s3cfg.Path, s3ClientOps)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create aws S3 client: %s", err.Error())
-	}
-	u := backup.NewUploader(sc, provider, time.Duration(uCfg.Interval))
-	u.Start(ctx, str.IsLeader)
-	return u, nil
-}
-
-func createExtensionsStore(cfg *Config) (*extensions.Store, error) {
-	str, err := extensions.NewStore(filepath.Join(cfg.DataPath, "extensions"))
-	if err != nil {
-		log.Fatalf("failed to create extension store: %s", err.Error())
-	}
-
-	if len(cfg.ExtensionPaths) > 0 {
-		for _, path := range cfg.ExtensionPaths {
-			if isDir(path) {
-				if err := str.LoadFromDir(path); err != nil {
-					log.Fatalf("failed to load extensions from directory: %s", err.Error())
-				}
-			} else if rarchive.IsZipFile(path) {
-				if err := str.LoadFromZip(path); err != nil {
-					log.Fatalf("failed to load extensions from zip file: %s", err.Error())
-				}
-			} else if rarchive.IsTarGzipFile(path) {
-				if err := str.LoadFromTarGzip(path); err != nil {
-					log.Fatalf("failed to load extensions from tar.gz file: %s", err.Error())
-				}
-			} else {
-				if err := str.LoadFromFile(path); err != nil {
-					log.Fatalf("failed to load extension from file: %s", err.Error())
-				}
-			}
-		}
-	}
-
-	return str, nil
-}
-
-func createStore(cfg *Config, ln *tcp.Layer, extensions []string) (*store.Store, error) {
-	dbConf := store.NewDBConfig()
-	dbConf.OnDiskPath = cfg.OnDiskPath
-	dbConf.FKConstraints = cfg.FKConstraints
-	dbConf.Extensions = extensions
-
-	str := store.New(ln, &store.Config{
-		DBConf: dbConf,
-		Dir:    cfg.DataPath,
-		ID:     cfg.NodeID,
-	})
-
-	// Set optional parameters on store.
-	str.RaftLogLevel = cfg.RaftLogLevel
-	str.ShutdownOnRemove = cfg.RaftShutdownOnRemove
-	str.SnapshotThreshold = cfg.RaftSnapThreshold
-	str.SnapshotThresholdWALSize = cfg.RaftSnapThresholdWALSize
-	str.SnapshotInterval = cfg.RaftSnapInterval
-	str.LeaderLeaseTimeout = cfg.RaftLeaderLeaseTimeout
-	str.HeartbeatTimeout = cfg.RaftHeartbeatTimeout
-	str.ElectionTimeout = cfg.RaftElectionTimeout
-	str.ApplyTimeout = cfg.RaftApplyTimeout
-	str.BootstrapExpect = cfg.BootstrapExpect
-	str.ReapTimeout = cfg.RaftReapNodeTimeout
-	str.ReapReadOnlyTimeout = cfg.RaftReapReadOnlyNodeTimeout
-	str.AutoVacInterval = cfg.AutoVacInterval
-	str.AutoOptimizeInterval = cfg.AutoOptimizeInterval
-
-	if store.IsNewNode(cfg.DataPath) {
-		log.Printf("no preexisting node state detected in %s, node may be bootstrapping", cfg.DataPath)
-	} else {
-		log.Printf("preexisting node state detected in %s", cfg.DataPath)
-	}
-
-	return str, nil
-}
-
-func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
-	var c disco.Client
-	var err error
-
-	rc := cfg.DiscoConfigReader()
-	defer func() {
-		if rc != nil {
-			rc.Close()
-		}
-	}()
-	if cfg.DiscoMode == DiscoModeConsulKV {
-		var consulCfg *consul.Config
-		consulCfg, err = consul.NewConfigFromReader(rc)
-		if err != nil {
-			return nil, fmt.Errorf("create Consul config: %s", err.Error())
-		}
-
-		c, err = consul.New(cfg.DiscoKey, consulCfg)
-		if err != nil {
-			return nil, fmt.Errorf("create Consul client: %s", err.Error())
-		}
-	} else if cfg.DiscoMode == DiscoModeEtcdKV {
-		var etcdCfg *etcd.Config
-		etcdCfg, err = etcd.NewConfigFromReader(rc)
-		if err != nil {
-			return nil, fmt.Errorf("create etcd config: %s", err.Error())
-		}
-
-		c, err = etcd.New(cfg.DiscoKey, etcdCfg)
-		if err != nil {
-			return nil, fmt.Errorf("create etcd client: %s", err.Error())
-		}
-	} else {
-		return nil, fmt.Errorf("invalid disco service: %s", cfg.DiscoMode)
-	}
-	return disco.NewService(c, str, disco.VoterSuffrage(!cfg.RaftNonVoter)), nil
-}
-
-func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore) (*httpd.Service, error) {
-	// Create HTTP server and load authentication information.
-	s := httpd.New(cfg.HTTPAddr, str, cltr, credStr)
-
-	s.CACertFile = cfg.HTTPx509CACert
-	s.CertFile = cfg.HTTPx509Cert
-	s.KeyFile = cfg.HTTPx509Key
-	s.ClientVerify = cfg.HTTPVerifyClient
-	s.DefaultQueueCap = cfg.WriteQueueCap
-	s.DefaultQueueBatchSz = cfg.WriteQueueBatchSz
-	s.DefaultQueueTimeout = cfg.WriteQueueTimeout
-	s.DefaultQueueTx = cfg.WriteQueueTx
-	s.BuildInfo = map[string]interface{}{
-		"commit":             cmd.Commit,
-		"branch":             cmd.Branch,
-		"version":            cmd.Version,
-		"compiler_toolchain": runtime.Compiler,
-		"compiler_command":   cmd.CompilerCommand,
-		"build_time":         cmd.Buildtime,
-	}
-	s.SetAllowOrigin(cfg.HTTPAllowOrigin)
-	return s, s.Start()
-}
-
-// startNodeMux starts the TCP mux on the given listener, which should be already
-// bound to the relevant interface.
-func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
-	var err error
-	adv := tcp.NameAddress{
-		Address: cfg.RaftAdv,
-	}
-
-	var mux *tcp.Mux
-	if cfg.NodeX509Cert != "" {
-		var b strings.Builder
-		b.WriteString(fmt.Sprintf("enabling node-to-node encryption with cert: %s, key: %s",
-			cfg.NodeX509Cert, cfg.NodeX509Key))
-		if cfg.NodeX509CACert != "" {
-			b.WriteString(fmt.Sprintf(", CA cert %s", cfg.NodeX509CACert))
-		}
-		if cfg.NodeVerifyClient {
-			b.WriteString(", mutual TLS enabled")
-		} else {
-			b.WriteString(", mutual TLS disabled")
-		}
-		log.Println(b.String())
-		mux, err = tcp.NewTLSMux(ln, adv, cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert,
-			cfg.NoNodeVerify, cfg.NodeVerifyClient)
-	} else {
-		mux, err = tcp.NewMux(ln, adv)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to create node-to-node mux: %s", err.Error())
-	}
-	go mux.Serve()
-	return mux, nil
-}
-
-func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
-	if cfg.AuthFile == "" {
-		return nil, nil
-	}
-	return auth.NewCredentialsStoreFromFile(cfg.AuthFile)
-}
-
-func clusterService(cfg *Config, ln net.Listener, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore) (*cluster.Service, error) {
-	c := cluster.New(ln, db, mgr, credStr)
-	c.SetAPIAddr(cfg.HTTPAdv)
-	c.SetVersion(cmd.Version)
-	c.EnableHTTPS(cfg.HTTPx509Cert != "" && cfg.HTTPx509Key != "") // Conditions met for an HTTPS API
-	if err := c.Open(); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func createClusterClient(cfg *Config, clstr *cluster.Service) (*cluster.Client, error) {
-	var dialerTLSConfig *tls.Config
-	var err error
-	if cfg.NodeX509Cert != "" || cfg.NodeX509CACert != "" {
-		dialerTLSConfig, err = rtls.CreateClientConfig(cfg.NodeX509Cert, cfg.NodeX509Key,
-			cfg.NodeX509CACert, cfg.NodeVerifyServerName, cfg.NoNodeVerify)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TLS config for cluster dialer: %s", err.Error())
-		}
-	}
-	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, dialerTLSConfig)
-	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
-	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
-		return nil, fmt.Errorf("failed to set cluster client local parameters: %s", err.Error())
-	}
-	if err := clstrClient.SetLocalVersion(cmd.Version); err != nil {
-		return nil, fmt.Errorf("failed to set cluster client local version: %s", err.Error())
-	}
-	return clstrClient, nil
-}
-
-func createCluster(ctx context.Context, cfg *Config, hasPeers bool, client *cluster.Client, str *store.Store,
-	httpServ *httpd.Service, credStr *auth.CredentialsStore) error {
-	joins := cfg.JoinAddresses()
-	if err := networkCheckJoinAddrs(joins); err != nil {
-		return err
-	}
-	if joins == nil && cfg.DiscoMode == "" && !hasPeers {
-		if cfg.RaftNonVoter {
-			return fmt.Errorf("cannot create a new non-voting node without joining it to an existing cluster")
-		}
-
-		// Brand new node, told to bootstrap itself. So do it.
-		log.Println("bootstrapping single new node")
-		if err := str.Bootstrap(store.NewServer(str.ID(), cfg.RaftAdv, true)); err != nil {
-			return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
-		}
-		return nil
-	}
-
-	// Prepare definition of being part of a cluster.
-	bootDoneFn := func() bool {
-		leader, _ := str.LeaderAddr()
-		return leader != ""
-	}
-	clusterSuf := cluster.VoterSuffrage(!cfg.RaftNonVoter)
-
-	joiner := cluster.NewJoiner(client, cfg.JoinAttempts, cfg.JoinInterval)
-	joiner.SetCredentials(cluster.CredentialsFor(credStr, cfg.JoinAs))
-	if joins != nil && cfg.BootstrapExpect == 0 {
-		// Explicit join operation requested, so do it.
-		j, err := joiner.Do(ctx, joins, str.ID(), cfg.RaftAdv, clusterSuf)
-		if err != nil {
-			return fmt.Errorf("failed to join cluster: %s", err.Error())
-		}
-		log.Println("successfully joined cluster at", j)
-		return nil
-	}
-
-	if joins != nil && cfg.BootstrapExpect > 0 {
-		// Bootstrap with explicit join addresses requests.
-		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), client)
-		bs.SetCredentials(cluster.CredentialsFor(credStr, cfg.JoinAs))
-		return bs.Boot(ctx, str.ID(), cfg.RaftAdv, clusterSuf, bootDoneFn, cfg.BootstrapExpectTimeout)
-	}
-
-	if cfg.DiscoMode == "" {
-		// No more clustering techniques to try. Node will just sit, probably using
-		// existing Raft state.
-		return nil
-	}
-
-	// DNS-based discovery requested. It's OK to proceed with this even if this node
-	// is already part of a cluster. Re-joining and re-notifying other nodes will be
-	// ignored when the node is already part of the cluster.
-	log.Printf("discovery mode: %s", cfg.DiscoMode)
-	switch cfg.DiscoMode {
-	case DiscoModeDNS, DiscoModeDNSSRV:
-		rc := cfg.DiscoConfigReader()
-		defer func() {
-			if rc != nil {
-				rc.Close()
-			}
-		}()
-
-		var provider interface {
-			cluster.AddressProvider
-			httpd.StatusReporter
-		}
-		if cfg.DiscoMode == DiscoModeDNS {
-			dnsCfg, err := dns.NewConfigFromReader(rc)
-			if err != nil {
-				return fmt.Errorf("error reading DNS configuration: %s", err.Error())
-			}
-			provider = dns.NewWithPort(dnsCfg, cfg.RaftPort())
-
-		} else {
-			dnssrvCfg, err := dnssrv.NewConfigFromReader(rc)
-			if err != nil {
-				return fmt.Errorf("error reading DNS configuration: %s", err.Error())
-			}
-			provider = dnssrv.New(dnssrvCfg)
-		}
-
-		bs := cluster.NewBootstrapper(provider, client)
-		bs.SetCredentials(cluster.CredentialsFor(credStr, cfg.JoinAs))
-		httpServ.RegisterStatus("disco", provider)
-		return bs.Boot(ctx, str.ID(), cfg.RaftAdv, clusterSuf, bootDoneFn, cfg.BootstrapExpectTimeout)
-
-	case DiscoModeEtcdKV, DiscoModeConsulKV:
-		discoService, err := createDiscoService(cfg, str)
-		if err != nil {
-			return fmt.Errorf("failed to start discovery service: %s", err.Error())
-		}
-		// Safe to start reporting before doing registration. If the node hasn't bootstrapped
-		// yet, or isn't leader, reporting will just be a no-op until something changes.
-		go discoService.StartReporting(cfg.NodeID, cfg.HTTPURL(), cfg.RaftAdv)
-		httpServ.RegisterStatus("disco", discoService)
-
-		if hasPeers {
-			log.Printf("preexisting node configuration detected, not registering with discovery service")
+	cli.SetUsageStyle(cli.ManualStyle)
+	cli.Run(new(argT), func(ctx *cli.Context) error {
+		argv := ctx.Argv().(*argT)
+		if argv.Help {
+			ctx.WriteUsage()
 			return nil
 		}
-		log.Println("no preexisting nodes, registering with discovery service")
 
-		leader, addr, err := discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
-		if err != nil {
-			return fmt.Errorf("failed to register with discovery service: %s", err.Error())
+		if argv.Version {
+			ctx.String("Version %s, commit %s, branch %s, built on %s\n", cmd.Version,
+				cmd.Commit, cmd.Branch, cmd.Buildtime)
+			return nil
 		}
-		if leader {
-			log.Println("node registered as leader using discovery service")
-			if err := str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
-				return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
-			}
-		} else {
-			for {
-				log.Printf("discovery service returned %s as join address", addr)
-				if j, err := joiner.Do(ctx, []string{addr}, str.ID(), cfg.RaftAdv, clusterSuf); err != nil {
-					log.Printf("failed to join cluster at %s: %s", addr, err.Error())
 
-					time.Sleep(time.Second)
-					_, addr, err = discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
-					if err != nil {
-						log.Printf("failed to get updated leader: %s", err.Error())
-					}
-					continue
-				} else {
-					log.Println("successfully joined cluster at", j)
+		httpClient, err := getHTTPClient(argv)
+		if err != nil {
+			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
+			return nil
+		}
+
+		connectionStr := fmt.Sprintf("%s://%s", argv.Protocol, address6(argv))
+		version, err := getVersionWithClient(httpClient, argv)
+		if err != nil {
+			msg := err.Error()
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				msg = fmt.Sprintf("Unable to connect to futriix at %s - is it running?",
+					connectionStr)
+			}
+			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), msg)
+			return nil
+		}
+
+		fmt.Println("Welcome to the Clif-Futriix CLI")
+		fmt.Printf("Enter \".help\" for usage hints.\n")
+		fmt.Printf("Connected to %s running version %s\n", connectionStr, version)
+		fmt.Printf("\n")
+
+		blobArray := false
+		timer := false
+		consistency := "weak"
+		//prefix := fmt.Sprintf("%s>", address6(argv))
+		 prefix := fmt.Sprintf("futriiX:~>")
+		term, err := prompt.NewTerminal()
+		if err != nil {
+			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
+			return nil
+		}
+		term.Close()
+
+		// Set up command history.
+		hr := history.Reader()
+		if hr != nil {
+			histCmds, err := history.Read(hr)
+			if err == nil {
+				term.History = histCmds
+			}
+			hr.Close()
+		}
+
+		hosts := createHostList(argv)
+		client := httpcl.NewClient(httpClient, hosts,
+			httpcl.WithScheme(argv.Protocol),
+			httpcl.WithBasicAuth(argv.Credentials),
+			httpcl.WithPrefix(argv.Prefix))
+
+	FOR_READ:
+		for {
+			term.Reopen()
+			line, err := term.Basic(prefix, false)
+			term.Close()
+			if err != nil {
+				if errors.Is(err, prompt.ErrEOF) {
+					break FOR_READ
+				}
+				return err
+			}
+
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var (
+				index = strings.Index(line, " ")
+				cmd   = line
+			)
+			if index >= 0 {
+				cmd = line[:index]
+			}
+			cmd = strings.ToUpper(cmd)
+			switch cmd {
+			case ".CONSISTENCY":
+				if index == -1 || index == len(line)-1 {
+					ctx.String("%s\n", consistency)
 					break
 				}
+				err = setConsistency(line[index+1:], &consistency)
+			case ".EXTENSIONS":
+				err = extensions(ctx, client, cmd, argv)
+			case ".TABLES":
+				err = queryWithClient(ctx, client, timer, blobArray, consistency, `SELECT name FROM sqlite_master WHERE type="table"`)
+			case ".INDEXES":
+				err = queryWithClient(ctx, client, timer, blobArray, consistency, `SELECT sql FROM sqlite_master WHERE type="index"`)
+			case ".SCHEMA":
+				err = queryWithClient(ctx, client, timer, blobArray, consistency, `SELECT sql FROM sqlite_master`)
+			case ".TIMER":
+				err = toggleFlag(line[index+1:], &timer)
+			case ".BLOBARRAY":
+				err = toggleFlag(line[index+1:], &blobArray)
+			case ".STATUS":
+				err = status(ctx, client, cmd, argv)
+			case ".READY":
+				err = ready(ctx, client, argv)
+			case ".NODES":
+				if index == -1 || index == len(line)-1 {
+					err = nodes(ctx, client, cmd, line, argv, false)
+					break
+				}
+				err = nodes(ctx, client, cmd, line, argv, true)
+			case ".EXPVAR":
+				err = expvar(ctx, client, cmd, line, argv)
+			case ".REMOVE":
+				err = removeNode(client, line[index+1:], argv)
+			case ".BACKUP":
+				if index == -1 || index == len(line)-1 {
+					err = fmt.Errorf("please specify an output file for the backup")
+					break
+				}
+				err = backup(ctx, line[index+1:], argv)
+			case ".RESTORE":
+				if index == -1 || index == len(line)-1 {
+					err = fmt.Errorf("please specify an input file to restore from")
+					break
+				}
+				err = restore(ctx, line[index+1:], argv)
+			case ".BOOT":
+				if index == -1 || index == len(line)-1 {
+					err = fmt.Errorf("please specify an input file to boot with")
+					break
+				}
+				err = boot(ctx, line[index+1:], argv)
+			case ".SYSDUMP":
+				if index == -1 || index == len(line)-1 {
+					err = fmt.Errorf("please specify an output file for the sysdump")
+					break
+				}
+				err = sysdump(ctx, httpClient, line[index+1:], argv)
+			case ".DUMP":
+				if index == -1 || index == len(line)-1 {
+					err = fmt.Errorf("please specify an output file for the SQL text")
+					break
+				}
+				err = dump(ctx, line[index+1:], argv)
+			case ".HELP":
+				ctx.String("%s", strings.Join(cliHelp, "\n"))
+			case ".QUIT", "QUIT", "EXIT", ".EXIT":
+				break FOR_READ
+			case ".SNAPSHOT":
+				err = snapshot(client, argv)
+			case "SELECT", "PRAGMA":
+				err = queryWithClient(ctx, client, timer, blobArray, consistency, line)
+			default:
+				err = executeWithClient(ctx, client, timer, line)
+			}
+			if hcerr, ok := err.(*httpcl.HostChangedError); ok {
+				// If a previous request was executed on a different host, make that change
+				// visible to the user.
+				if hcerr != nil {
+					prefix = fmt.Sprintf("%s>", hcerr.NewHost)
+				}
+			} else if err != nil {
+				ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
 			}
 		}
 
-	default:
-		return fmt.Errorf("invalid disco mode %s", cfg.DiscoMode)
+		hw := history.Writer()
+		if hw != nil {
+			sz := history.Size()
+			history.Write(term.History, sz, hw)
+			hw.Close()
+			if sz <= 0 {
+				history.Delete()
+			}
+		}
+		ctx.String("bye~\n")
+		return nil
+	})
+}
+
+func toggleFlag(op string, flag *bool) error {
+	if op != "on" && op != "off" {
+		return fmt.Errorf("invalid option '%s'. Use 'on' or 'off' (default)", op)
+	}
+	*flag = (op == "on")
+	return nil
+}
+
+func setConsistency(r string, c *string) error {
+	if r != "strong" && r != "weak" && r != "linearizable" && r != "none" {
+		return fmt.Errorf("invalid consistency '%s'. Use 'none', 'weak', 'linearizable', or 'strong'", r)
+	}
+	*c = r
+	return nil
+}
+
+func makeJSONBody(line string) string {
+	data, err := json.Marshal([]string{line})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func status(ctx *cli.Context, client *httpcl.Client, line string, argv *argT) error {
+	url := fmt.Sprintf("%s://%s/status", argv.Protocol, address6(argv))
+	return cliJSON(ctx, client, line, url)
+}
+
+func ready(ctx *cli.Context, client *httpcl.Client, argv *argT) error {
+	u := url.URL{
+		Scheme: argv.Protocol,
+		Host:   address6(argv),
+		Path:   fmt.Sprintf("%sreadyz", argv.Prefix),
+	}
+	urlStr := u.String()
+
+	resp, err := client.Get(urlStr)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == 200 {
+		ctx.String("ready\n")
+	} else {
+		ctx.String("not ready\n")
+	}
+
+	return nil
+}
+
+// nodes returns the status of nodes in the cluster. If all is true, then
+// non-voting nodes are included in the response.
+func nodes(ctx *cli.Context, client *httpcl.Client, cmd, line string, argv *argT, all bool) error {
+	path := "nodes"
+	if all {
+		path = "nodes?nonvoters"
+	}
+	url := fmt.Sprintf("%s://%s/%s", argv.Protocol, address6(argv), path)
+	return cliJSON(ctx, client, "", url)
+}
+
+func expvar(ctx *cli.Context, client *httpcl.Client, cmd, line string, argv *argT) error {
+	url := fmt.Sprintf("%s://%s/debug/vars", argv.Protocol, address6(argv))
+	return cliJSON(ctx, client, line, url)
+}
+
+func snapshot(client *httpcl.Client, argv *argT) error {
+	url := fmt.Sprintf("%s://%s/snapshot", argv.Protocol, address6(argv))
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return err
+	}
+	if argv.Credentials != "" {
+		creds := strings.Split(argv.Credentials, ":")
+		if len(creds) != 2 {
+			return fmt.Errorf("invalid Basic Auth credentials format")
+		}
+		req.SetBasicAuth(creds[0], creds[1])
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("server responded with %s", resp.Status)
 	}
 	return nil
 }
 
-func networkCheckJoinAddrs(joinAddrs []string) error {
-	if len(joinAddrs) > 0 {
-		log.Println("checking that supplied join addresses don't serve HTTP(S)")
-		if addr, ok := httpd.AnyServingHTTP(joinAddrs); ok {
-			return fmt.Errorf("join address %s appears to be serving HTTP when it should be Raft", addr)
+func sysdump(ctx *cli.Context, client *http.Client, filename string, argv *argT) error {
+	_ = ctx
+	nodes, err := getNodes(client, argv)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, n := range nodes {
+		if n.ApiAddr == "" {
+			continue
+		}
+		urls := []string{
+			fmt.Sprintf("%s/status?pretty", n.ApiAddr),
+			fmt.Sprintf("%s/nodes?pretty", n.ApiAddr),
+			fmt.Sprintf("%s/readyz", n.ApiAddr),
+			fmt.Sprintf("%s/debug/vars", n.ApiAddr),
+		}
+		if err := urlsToWriter(client, urls, f, argv); err != nil {
+			f.WriteString(fmt.Sprintf("Error sysdumping %s: %s\n", n.ApiAddr, err.Error()))
 		}
 	}
 	return nil
+}
+
+func getNodes(client *http.Client, argv *argT) (Nodes, error) {
+	u := url.URL{
+		Scheme: argv.Protocol,
+		Host:   address6(argv),
+		Path:   fmt.Sprintf("%snodes", argv.Prefix),
+	}
+	urlStr := u.String()
+
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	if argv.Credentials != "" {
+		creds := strings.Split(argv.Credentials, ":")
+		if len(creds) != 2 {
+			return nil, fmt.Errorf("invalid Basic Auth credentials format")
+		}
+		req.SetBasicAuth(creds[0], creds[1])
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var nodes Nodes
+	if err := parseResponse(&response, &nodes); err != nil {
+		return nil, err
+	}
+
+	return nodes, nil
+}
+
+func getHTTPClient(argv *argT) (*http.Client, error) {
+	tlsConfig, err := rtls.CreateClientConfig(argv.ClientCert, argv.ClientKey, argv.CACert, rtls.NoServerName, argv.Insecure)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig.NextProtos = nil // CLI refuses to connect otherwise.
+
+	client := http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+			Proxy:           http.ProxyFromEnvironment,
+		},
+		Timeout: argv.HTTPTimeout.Duration,
+	}
+
+	// Explicitly handle redirects.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	return &client, nil
+}
+
+func getVersionWithClient(client *http.Client, argv *argT) (string, error) {
+	u := url.URL{
+		Scheme: argv.Protocol,
+		Host:   address6(argv),
+		Path:   fmt.Sprintf("%s/status", argv.Prefix),
+	}
+	urlStr := u.String()
+
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return "", err
+	}
+	if argv.Credentials != "" {
+		creds := strings.Split(argv.Credentials, ":")
+		if len(creds) != 2 {
+			return "", fmt.Errorf("invalid Basic Auth credentials format")
+		}
+		req.SetBasicAuth(creds[0], creds[1])
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	version, ok := resp.Header["X-Rqlite-Version"]
+	if !ok || len(version) != 1 {
+		return "unknown", nil
+	}
+	return version[0], nil
+}
+
+func sendRequest(ctx *cli.Context, makeNewRequest func(string) (*http.Request, error), urlStr string, argv *argT) (*[]byte, error) {
+	// create a byte-based buffer that implements io.Writer
+	var buf []byte
+	w := bytes.NewBuffer(buf)
+	_, err := sendRequestW(ctx, makeNewRequest, urlStr, argv, w)
+	if err != nil {
+		return nil, err
+	}
+	return &buf, nil
+}
+
+func sendRequestW(ctx *cli.Context, makeNewRequest func(string) (*http.Request, error), urlStr string, argv *argT, w io.Writer) (int64, error) {
+	_ = ctx
+	url := urlStr
+	tlsConfig, err := rtls.CreateClientConfig(argv.ClientCert, argv.ClientKey, argv.CACert, rtls.NoServerName, argv.Insecure)
+	if err != nil {
+		return 0, err
+	}
+	tlsConfig.NextProtos = nil // CLI refuses to connect otherwise.
+	client := http.Client{Transport: &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Proxy:           http.ProxyFromEnvironment,
+	}}
+
+	// Explicitly handle redirects.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	nRedirect := 0
+	for {
+		req, err := makeNewRequest(url)
+		if err != nil {
+			return 0, err
+		}
+
+		if argv.Credentials != "" {
+			creds := strings.Split(argv.Credentials, ":")
+			if len(creds) != 2 {
+				return 0, fmt.Errorf("invalid Basic Auth credentials format")
+			}
+			req.SetBasicAuth(creds[0], creds[1])
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+
+		n, err := io.Copy(w, resp.Body)
+		if err != nil {
+			return n, err
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			return 0, fmt.Errorf("unauthorized")
+		}
+
+		if resp.StatusCode == http.StatusMovedPermanently {
+			nRedirect++
+			if nRedirect > maxRedirect {
+				return 0, fmt.Errorf("maximum leader redirect limit exceeded")
+			}
+			url = resp.Header["Location"][0]
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return 0, fmt.Errorf("server responded with: %s", resp.Status)
+		}
+
+		return n, nil
+	}
+}
+
+func parseResponse(response *[]byte, ret interface{}) error {
+	decoder := json.NewDecoder(strings.NewReader(string(*response)))
+	decoder.UseNumber()
+	return decoder.Decode(ret)
+}
+
+func extensions(ctx *cli.Context, client *httpcl.Client, cmd string, argv *argT) error {
+	_ = cmd
+	url := fmt.Sprintf("%s://%s/status?key=extensions", argv.Protocol, address6(argv))
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized")
+	} else if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	ret := make(map[string]interface{})
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&ret); err != nil {
+		return err
+	}
+
+	exts, ok := ret["names"]
+	if !ok {
+		return nil
+	}
+	for _, ext := range exts.([]interface{}) {
+		ctx.String("%s\n", ext.(string))
+	}
+
+	return nil
+}
+
+// cliJSON fetches JSON from a URL, and displays it at the CLI. If line contains more
+// than one word, then the JSON is filtered to only show the key specified in the
+// second word.
+func cliJSON(ctx *cli.Context, client *httpcl.Client, line, url string) error {
+	_ = ctx
+	// Recursive JSON printer.
+	var pprint func(indent int, m map[string]interface{})
+	pprint = func(indent int, m map[string]interface{}) {
+		indentation := "  "
+		for k, v := range m {
+			if v == nil {
+				continue
+			}
+			switch w := v.(type) {
+			case map[string]interface{}:
+				for i := 0; i < indent; i++ {
+					fmt.Print(indentation)
+				}
+				fmt.Printf("%s:\n", k)
+				pprint(indent+1, w)
+			default:
+				for i := 0; i < indent; i++ {
+					fmt.Print(indentation)
+				}
+				fmt.Printf("%s: %v\n", k, v)
+			}
+		}
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	ret := make(map[string]interface{})
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&ret); err != nil {
+		return err
+	}
+
+	// Specific key requested?
+	parts := strings.Split(line, " ")
+	if len(parts) >= 2 {
+		ret = map[string]interface{}{parts[1]: ret[parts[1]]}
+	}
+	pprint(0, ret)
+
+	return nil
+}
+
+func urlsToWriter(client *http.Client, urls []string, w io.Writer, argv *argT) error {
+	for i := range urls {
+		err := func() error {
+			w.Write([]byte("\n=========================================\n"))
+			w.Write([]byte(fmt.Sprintf("URL: %s\n", urls[i])))
+
+			req, err := http.NewRequest("GET", urls[i], nil)
+			if err != nil {
+				return err
+			}
+			if argv.Credentials != "" {
+				creds := strings.Split(argv.Credentials, ":")
+				if len(creds) != 2 {
+					return fmt.Errorf("invalid Basic Auth credentials format")
+				}
+				req.SetBasicAuth(creds[0], creds[1])
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				if _, err := w.Write([]byte(fmt.Sprintf("Status: %s\n\n", err))); err != nil {
+					return err
+				}
+				return nil
+			}
+			defer resp.Body.Close()
+
+			if _, err := w.Write([]byte(fmt.Sprintf("Status: %s\n\n", resp.Status))); err != nil {
+				return err
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				return nil
+			}
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
+
+			if _, err := w.Write(body); err != nil {
+				return err
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func createHostList(argv *argT) []string {
+	var hosts = make([]string, 0)
+	hosts = append(hosts, address6(argv))
+	hosts = append(hosts, strings.Split(argv.Alternatives, ",")...)
+	return hosts
+}
+
+// address6 returns a string representation of the given address and port,
+// which is compatible with IPv6 addresses.
+func address6(argv *argT) string {
+	return net.JoinHostPort(argv.Host, fmt.Sprintf("%d", argv.Port))
 }
