@@ -104,21 +104,23 @@ func main() {
 		if err != nil {
 			msg := err.Error()
 			if errors.Is(err, syscall.ECONNREFUSED) {
-				msg = fmt.Sprintf("Unable to connect to rqlited at %s - is it running?",
+				msg = fmt.Sprintf("Unable to connect to futriix at %s - is it running?",
 					connectionStr)
 			}
 			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), msg)
 			return nil
 		}
 
-		fmt.Println("Welcome to the rqlite CLI.")
+		fmt.Println("Welcome to the Clif-Futriix CLI")
 		fmt.Printf("Enter \".help\" for usage hints.\n")
 		fmt.Printf("Connected to %s running version %s\n", connectionStr, version)
+		fmt.Printf("\n")
 
 		blobArray := false
 		timer := false
 		consistency := "weak"
-		prefix := fmt.Sprintf("%s>", address6(argv))
+		//prefix := fmt.Sprintf("%s>", address6(argv))
+		 prefix := fmt.Sprintf("futriiX:~>")
 		term, err := prompt.NewTerminal()
 		if err != nil {
 			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
